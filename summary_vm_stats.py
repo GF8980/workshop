@@ -6,6 +6,7 @@ Summarize vm_stats.jsonl with pandas.
   * Handles aggregated or per-NIC `net_io_per_sec`
   * Handles per-mount `nfs_io_per_sec` and `nfs_usage` if present
   * Handles disk busy% (when available on Linux)
+  * Computes NFS share of total network IO
 - Produces console table + JSON and CSV outputs.
 
 Requires: pandas, numpy
@@ -160,6 +161,13 @@ def flatten_columns(df: pd.DataFrame) -> pd.DataFrame:
         df["nfs.usage_percent_avg"] = df["nfs_usage"].apply(nfs_usage_percent_avg)
         df = df.drop(columns=["nfs_usage"])
 
+    # --- NFS share of total network IO (percentage)
+    needed_cols = {"net.bytes_sent", "net.bytes_recv", "nfs.read_bytes", "nfs.write_bytes"}
+    if needed_cols.issubset(df.columns):
+        net_tot = df["net.bytes_sent"].fillna(0) + df["net.bytes_recv"].fillna(0)
+        nfs_tot = df["nfs.read_bytes"].fillna(0) + df["nfs.write_bytes"].fillna(0)
+        df["nfs.net_io_pct"] = np.where(net_tot > 0, (nfs_tot / net_tot) * 100.0, np.nan)
+
     return df
 
 def estimate_sample_dt(index: pd.DatetimeIndex) -> Optional[float]:
@@ -252,6 +260,7 @@ def build_metric_map(df: pd.DataFrame) -> List[Tuple[str, str]]:
         ("Net recv (B/s)", "net.bytes_recv"),
         ("NFS read (B/s)", "nfs.read_bytes"),
         ("NFS write (B/s)", "nfs.write_bytes"),
+        ("NFS % of Net IO", "nfs.net_io_pct"),
         ("Load1", "load.load1"),
         ("Load per core", "load.load_per_core"),
         ("Disk usage %", "disk.percent"),
@@ -420,6 +429,8 @@ def main():
         ("Disk write (B/s)", "disk_io_per_sec.write_bytes"),
         ("Net send (B/s)", "net.bytes_sent"),
         ("Net recv (B/s)", "net.bytes_recv"),
+        ("NFS read (B/s)", "nfs.read_bytes"),
+        ("NFS write (B/s)", "nfs.write_bytes"),
     ]
     extras = {}
 
@@ -429,6 +440,20 @@ def main():
             extras.update(burst_metrics(label_base(label), series, sample_dt))
             cad = detect_cadence(series, sample_dt)
             extras.update({f"{label_base(label)}_{k}": v for k, v in cad.items()})
+
+    # NFS portion of network traffic
+    if {"nfs.read_bytes", "nfs.write_bytes", "net.bytes_sent", "net.bytes_recv"} <= set(dfw.columns):
+        net_send_total = dfw["net.bytes_sent"].fillna(0).sum()
+        net_recv_total = dfw["net.bytes_recv"].fillna(0).sum()
+        nfs_read_total = dfw["nfs.read_bytes"].fillna(0).sum()
+        nfs_write_total = dfw["nfs.write_bytes"].fillna(0).sum()
+        if net_recv_total > 0:
+            extras["nfs_read_pct_of_net_recv_total"] = float(nfs_read_total / net_recv_total * 100.0)
+        if net_send_total > 0:
+            extras["nfs_write_pct_of_net_send_total"] = float(nfs_write_total / net_send_total * 100.0)
+        net_total = net_send_total + net_recv_total
+        if net_total > 0:
+            extras["nfs_total_pct_of_net_total"] = float((nfs_read_total + nfs_write_total) / net_total * 100.0)
 
     # Build metric list
     metrics = build_metric_map(dfw)
@@ -441,7 +466,7 @@ def main():
         rows.append(summarize_series(label, series, th, sample_dt))
 
         # Extra throughput aggregates for bytes/sec metrics
-        if label in {"Disk read (B/s)", "Disk write (B/s)", "Net send (B/s)", "Net recv (B/s)"}:
+        if label in {"Disk read (B/s)", "Disk write (B/s)", "Net send (B/s)", "Net recv (B/s)", "NFS read (B/s)", "NFS write (B/s)"}:
             extras.update(summarize_throughput(label_base(label), series, sample_dt))
 
     # Assemble DataFrame for nice printing and saving
